@@ -383,14 +383,18 @@ class ModelManager:
         # Build image-conditioning inputs from start/end frame paths on the job.
         # Both stages get the same temporal frame indices; the conditioner
         # handles spatial rescaling to (s1_h, s1_w) or (job.height, job.width).
+        # strength=0.7 matches the LTXVAddGuide default used in ComfyUI workflows.
+        # At 1.0 the model pixel-locks the frame and fights the prompt;
+        # at 0.7 it respects the characters / composition while following the motion.
+        FRAME_STRENGTH = 0.7
         frame_inputs: list = []
         if job.start_frame_path:
             frame_inputs.append(
-                ImageConditioningInput(path=job.start_frame_path, frame_idx=0, strength=1.0)
+                ImageConditioningInput(path=job.start_frame_path, frame_idx=0, strength=FRAME_STRENGTH)
             )
         if job.end_frame_path:
             frame_inputs.append(
-                ImageConditioningInput(path=job.end_frame_path, frame_idx=job.num_frames - 1, strength=1.0)
+                ImageConditioningInput(path=job.end_frame_path, frame_idx=job.num_frames - 1, strength=FRAME_STRENGTH)
             )
 
         with self._on_gpu(self._image_conditioner):
