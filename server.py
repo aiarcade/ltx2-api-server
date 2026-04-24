@@ -34,8 +34,8 @@ except ImportError:
 import httpx
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
@@ -58,11 +58,28 @@ MAX_JOBS_HISTORY = int(os.getenv("LTX_MAX_JOBS", "100"))
 # Streaming: build transformer on CPU and stream N layers ahead to GPU.
 # Required on 16 GB GPUs — the 22B transformer cannot be loaded all at once.
 STREAMING_PREFETCH_COUNT = int(os.getenv("LTX_STREAMING_PREFETCH", "2"))
+# Optional Bearer token required by /v1/* endpoints (LTX-Desktop compat layer).
+# If empty, any (or no) Authorization header is accepted.
+# Set to the same value you put in LTX-Desktop's API-key field so both match.
+CONSOLE_API_KEY: str = os.getenv("LTX_CONSOLE_API_KEY", "")
 
 # T4 VRAM-safe defaults (width & height must be multiples of 64)
 # Valid examples: 512×256, 640×384, 704×448, 768×512, 1024×576
 DEFAULT_WIDTH = 704
 DEFAULT_HEIGHT = 448
+
+# Camera-motion prompt suffixes (injected server-side for /v1/* endpoints).
+_CAMERA_MOTION_PROMPTS: dict[str, str] = {
+    "none": "",
+    "static": ", static camera, locked off shot, no camera movement",
+    "focus_shift": ", focus shift, rack focus, changing focal point",
+    "dolly_in": ", dolly in, camera pushing forward, smooth forward movement",
+    "dolly_out": ", dolly out, camera pulling back, smooth backward movement",
+    "dolly_left": ", dolly left, camera tracking left, lateral movement",
+    "dolly_right": ", dolly right, camera tracking right, lateral movement",
+    "jib_up": ", jib up, camera rising up, upward crane movement",
+    "jib_down": ", jib down, camera lowering down, downward crane movement",
+}
 DEFAULT_NUM_FRAMES = 65
 DEFAULT_FPS = 30
 DEFAULT_SEED = 42
@@ -100,6 +117,12 @@ class Job:
 
 # Bounded job store (oldest evicted first)
 jobs: OrderedDict[str, Job] = OrderedDict()
+
+# Events set by the worker when a /v1/* synchronous job finishes.
+_v1_done: dict[str, asyncio.Event] = {}
+
+# In-memory upload store for /v1/upload  (upload_id -> raw bytes)
+_v1_uploads: dict[str, bytes] = {}
 
 
 def _register_job(job: Job) -> None:
@@ -728,6 +751,10 @@ async def _worker() -> None:
         finally:
             job.completed_at = time.time()
             _generation_queue.task_done()
+            # Wake any /v1/* caller waiting for this job
+            event = _v1_done.pop(job.job_id, None)
+            if event is not None:
+                event.set()
 
 
 def _run_job(job: Job) -> None:
@@ -845,4 +872,269 @@ async def download(job_id: str) -> FileResponse:
         path=job.output_path,
         media_type="video/mp4",
         filename=f"{job.job_id}.mp4",
+    )
+
+
+# ===========================================================================
+# LTX-Desktop / LTX Console compatibility layer  (/v1/*)
+# ===========================================================================
+# These endpoints mirror the protocol used by api.ltx.video so that
+# LTX-Desktop (running on macOS) can point to this server instead of the
+# official LTX cloud.  Configure LTX-Desktop by setting:
+#
+#   LTX_API_BASE_URL=http://<this-server-ip>:8000
+#
+# in the environment before launching the LTX-Desktop backend (ltx2_server.py).
+# Also set LTX_CONSOLE_API_KEY here to match the API key you enter in
+# LTX-Desktop's settings so that the Bearer token is accepted.
+# ===========================================================================
+
+# ---- Pydantic models for /v1/* requests ----------------------------------
+
+class _V1TextToVideoRequest(BaseModel):
+    prompt: str
+    model: str = "ltx-2-3-fast"
+    resolution: str = "1024x576"
+    duration: float = Field(default=5.0, ge=1.0)
+    fps: float = Field(default=24.0, ge=1.0)
+    generate_audio: bool = False
+    camera_motion: str | None = None
+
+
+class _V1ImageToVideoRequest(BaseModel):
+    prompt: str
+    image_uri: str
+    model: str = "ltx-2-3-fast"
+    resolution: str = "1024x576"
+    duration: float = Field(default=5.0, ge=1.0)
+    fps: float = Field(default=24.0, ge=1.0)
+    generate_audio: bool = False
+    camera_motion: str | None = None
+
+
+class _V1AudioToVideoRequest(BaseModel):
+    prompt: str
+    audio_uri: str
+    image_uri: str | None = None
+    model: str = "ltx-2-3-pro"
+    resolution: str = "1024x576"
+
+
+# ---- Helpers --------------------------------------------------------------
+
+def _v1_check_auth(request: Request) -> None:
+    """Verify Bearer token if CONSOLE_API_KEY is configured."""
+    if not CONSOLE_API_KEY:
+        return
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:].strip() != CONSOLE_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _v1_parse_resolution(resolution: str) -> tuple[int, int]:
+    """Parse 'WxH' string to (width, height), e.g. '1920x1080' → (1920, 1080)."""
+    try:
+        w_str, h_str = resolution.lower().split("x")
+        return int(w_str), int(h_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid resolution '{resolution}' — expected WxH, e.g. '1920x1080'")
+
+
+def _v1_snap_to_t4(width: int, height: int) -> tuple[int, int]:
+    """Scale + snap to the max safe resolution for the T4, preserving aspect ratio.
+
+    Hard limit: 1024×576 for landscape, 576×1024 for portrait.
+    Both dimensions are rounded to the nearest multiple of 64 (two-stage
+    pipeline requirement).
+    """
+    # Choose portrait vs landscape limits
+    if height > width:
+        max_w, max_h = 576, 1024
+    else:
+        max_w, max_h = 1024, 576
+
+    scale = min(max_w / width, max_h / height, 1.0)
+    w = max(64, round(width * scale / 64) * 64)
+    h = max(64, round(height * scale / 64) * 64)
+    return w, h
+
+
+def _v1_num_frames(duration_sec: float, fps: float) -> int:
+    """Compute LTX-compatible num_frames: ((duration * fps) // 8) * 8 + 1, min 9."""
+    n = int((duration_sec * fps) // 8) * 8 + 1
+    return max(n, 9)
+
+
+def _v1_resolve_upload(uri: str) -> bytes:
+    """Return bytes for a previously-uploaded ltx-upload:// URI."""
+    if not uri.startswith("ltx-upload://"):
+        raise HTTPException(status_code=400, detail=f"Unsupported URI scheme: {uri!r}")
+    upload_id = uri[len("ltx-upload://"):]
+    data = _v1_uploads.get(upload_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail=f"Upload not found: {upload_id}")
+    return data
+
+
+async def _v1_generate(
+    prompt: str,
+    width: int,
+    height: int,
+    num_frames: int,
+    fps: int,
+) -> bytes:
+    """Submit a generation job, wait for it, and return the raw MP4 bytes.
+
+    This is the synchronous-from-the-caller's-perspective entry point used by
+    all /v1/* generation endpoints.  Internally it still uses the async job
+    queue so it does not block the event loop, and respects the single-worker
+    constraint (only one GPU job runs at a time).
+    """
+    seed = int(time.time()) % 2_147_483_647
+    job = Job(
+        job_id=str(uuid.uuid4()),
+        prompt=prompt,
+        negative_prompt="",
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+        seed=seed,
+    )
+    _register_job(job)
+
+    done_event = asyncio.Event()
+    _v1_done[job.job_id] = done_event
+    await _generation_queue.put(job)
+
+    logger.info(
+        "[v1/%s] queued %dx%d %d frames %.1f fps",
+        job.job_id[:8], width, height, num_frames, fps,
+    )
+
+    # Block this coroutine (not the thread) until the worker signals completion.
+    await done_event.wait()
+
+    if job.status == JobStatus.FAILED:
+        raise HTTPException(status_code=500, detail=job.error or "Generation failed")
+    if not job.output_path or not Path(job.output_path).exists():
+        raise HTTPException(status_code=500, detail="Output file missing after generation")
+
+    return Path(job.output_path).read_bytes()
+
+
+# ---- /v1/upload -----------------------------------------------------------
+
+@app.post("/v1/upload")
+async def v1_upload(request: Request) -> dict:
+    """Initiate a file upload (mirrors api.ltx.video /v1/upload).
+
+    Returns a pre-signed-style upload URL that points back to this server.
+    The caller should PUT the file to upload_url, then use storage_uri as
+    the image_uri / audio_uri in subsequent generation requests.
+    """
+    _v1_check_auth(request)
+    upload_id = str(uuid.uuid4())
+    base = str(request.base_url).rstrip("/")
+    return {
+        "upload_url": f"{base}/v1/upload-data/{upload_id}",
+        "storage_uri": f"ltx-upload://{upload_id}",
+        "required_headers": {},
+    }
+
+
+@app.put("/v1/upload-data/{upload_id}")
+async def v1_upload_data(upload_id: str, request: Request) -> Response:
+    """Receive the raw file bytes for a previously-initiated upload."""
+    data = await request.body()
+    _v1_uploads[upload_id] = data
+    logger.info("[v1/upload] stored %d bytes for id=%s", len(data), upload_id[:8])
+    return Response(status_code=200)
+
+
+# ---- /v1/text-to-video ----------------------------------------------------
+
+@app.post("/v1/text-to-video")
+async def v1_text_to_video(req: _V1TextToVideoRequest, request: Request) -> Response:
+    """Text-to-video generation (synchronous, returns video/mp4 bytes).
+
+    Implements the same interface as api.ltx.video/v1/text-to-video so that
+    LTX-Desktop configured with LTX_API_BASE_URL pointing here works without
+    any frontend changes.
+    """
+    _v1_check_auth(request)
+
+    # Parse and clamp resolution to what the T4 can handle
+    raw_w, raw_h = _v1_parse_resolution(req.resolution)
+    width, height = _v1_snap_to_t4(raw_w, raw_h)
+    if (raw_w, raw_h) != (width, height):
+        logger.info("[v1/t2v] resolution clamped %dx%d → %dx%d for T4", raw_w, raw_h, width, height)
+
+    num_frames = _v1_num_frames(req.duration, req.fps)
+    fps = int(req.fps)
+
+    # Inject camera-motion suffix into the prompt
+    cam = req.camera_motion or "none"
+    prompt = req.prompt + _CAMERA_MOTION_PROMPTS.get(cam, "")
+
+    video_bytes = await _v1_generate(
+        prompt=prompt,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+    )
+    return Response(content=video_bytes, media_type="video/mp4")
+
+
+# ---- /v1/image-to-video ---------------------------------------------------
+
+@app.post("/v1/image-to-video")
+async def v1_image_to_video(req: _V1ImageToVideoRequest, request: Request) -> Response:
+    """Image-to-video generation.
+
+    The image must first be uploaded via POST /v1/upload + PUT /v1/upload-data.
+    Currently falls back to pure text-to-video because the Job queue does not
+    yet carry image conditioning; the image_uri is accepted but ignored.
+    Full i2v support requires adding image_path to the Job model and wiring
+    it through ModelManager.generate().
+    """
+    _v1_check_auth(request)
+
+    # Resolve upload so we fail fast if the URI is unknown
+    _v1_resolve_upload(req.image_uri)
+
+    raw_w, raw_h = _v1_parse_resolution(req.resolution)
+    width, height = _v1_snap_to_t4(raw_w, raw_h)
+    num_frames = _v1_num_frames(req.duration, req.fps)
+    fps = int(req.fps)
+    cam = req.camera_motion or "none"
+    prompt = req.prompt + _CAMERA_MOTION_PROMPTS.get(cam, "")
+
+    logger.warning(
+        "[v1/i2v] image conditioning not yet wired in — generating text-to-video with the same prompt"
+    )
+    video_bytes = await _v1_generate(
+        prompt=prompt,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+    )
+    return Response(content=video_bytes, media_type="video/mp4")
+
+
+# ---- /v1/audio-to-video ---------------------------------------------------
+
+@app.post("/v1/audio-to-video")
+async def v1_audio_to_video(req: _V1AudioToVideoRequest, request: Request) -> Response:
+    """Audio-to-video generation — not yet implemented on this server.
+
+    The A2V pipeline requires a separate two-stage setup with audio conditioning
+    that has not been integrated into this server's Job model.  Returns 501.
+    """
+    _v1_check_auth(request)
+    raise HTTPException(
+        status_code=501,
+        detail="audio-to-video is not yet supported on this server",
     )
