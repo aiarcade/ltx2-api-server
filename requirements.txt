@@ -1,0 +1,35 @@
+# PyTorch (CUDA 12.1)
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision
+torchaudio
+
+# LTX-2 packages (installed from the cloned LTX-2 repo)
+# pip install -e /path/to/LTX-2/packages/ltx-core
+# pip install -e /path/to/LTX-2/packages/ltx-pipelines
+
+# Server dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+
+# Model loading / inference
+accelerate>=0.33.0
+transformers>=4.44.0
+safetensors>=0.4.0
+
+# Attention optimization (important for Turing / T4 GPUs)
+xformers>=0.0.28
+
+# HuggingFace model download
+huggingface_hub>=0.24.0
+
+# Media encoding
+av>=12.0.0
+einops>=0.8.0
+Pillow>=10.0.0
+tqdm>=4.66.0
+
+# Optional: .env file support
+python-dotenv>=1.0.0
