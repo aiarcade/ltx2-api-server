@@ -12,10 +12,12 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import gc
 import io
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -34,7 +36,7 @@ except ImportError:
 import httpx
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
@@ -113,6 +115,11 @@ class Job:
     output_path: str | None = None
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
+    # Optional image-conditioning frames (absolute paths to temp PNG files).
+    # start_frame_path → frame_idx=0 (anchors the first frame)
+    # end_frame_path   → frame_idx=num_frames-1 (anchors the last frame)
+    start_frame_path: str | None = None
+    end_frame_path: str | None = None
 
 
 # Bounded job store (oldest evicted first)
@@ -148,6 +155,11 @@ class GenerateRequest(BaseModel):
     num_frames: int = Field(default=DEFAULT_NUM_FRAMES, ge=9, le=257)
     fps: int = Field(default=DEFAULT_FPS, ge=1, le=60)
     seed: int | None = None
+    # Optional base64-encoded PNG/JPG frames for image conditioning.
+    # start_frame_b64 anchors the first frame of the video.
+    # end_frame_b64   anchors the last frame of the video.
+    start_frame_b64: str | None = None
+    end_frame_b64: str | None = None
 
 
 class GenerateResponse(BaseModel):
@@ -338,6 +350,7 @@ class ModelManager:
         """Run full generation for *job* (blocking, call from worker thread)."""
         from ltx_core.components.noisers import GaussianNoiser
         from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+        from ltx_pipelines.utils.args import ImageConditioningInput
         from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
         from ltx_pipelines.utils.denoisers import SimpleDenoiser
         from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings
@@ -367,10 +380,23 @@ class ModelManager:
         s1_w, s1_h = job.width // 2, job.height // 2
 
         # Move image conditioner to GPU only for this step, then back to CPU
+        # Build image-conditioning inputs from start/end frame paths on the job.
+        # Both stages get the same temporal frame indices; the conditioner
+        # handles spatial rescaling to (s1_h, s1_w) or (job.height, job.width).
+        frame_inputs: list = []
+        if job.start_frame_path:
+            frame_inputs.append(
+                ImageConditioningInput(path=job.start_frame_path, frame_idx=0, strength=1.0)
+            )
+        if job.end_frame_path:
+            frame_inputs.append(
+                ImageConditioningInput(path=job.end_frame_path, frame_idx=job.num_frames - 1, strength=1.0)
+            )
+
         with self._on_gpu(self._image_conditioner):
             stage_1_conditionings = self._image_conditioner(
                 lambda enc: combined_image_conditionings(
-                    images=[],
+                    images=frame_inputs,
                     height=s1_h,
                     width=s1_w,
                     video_encoder=enc,
@@ -378,7 +404,7 @@ class ModelManager:
                     device=device,
                 )
             )
-        logger.info("[%s] Stage 1 conditionings computed", job.job_id)
+        logger.info("[%s] Stage 1 conditionings computed (frames=%d)", job.job_id, len(frame_inputs))
 
         # Transformer loads/unloads GPU memory transiently via gpu_model()
         video_state, audio_state = self._diffusion_stage(
@@ -412,7 +438,7 @@ class ModelManager:
         with self._on_gpu(self._image_conditioner):
             stage_2_conditionings = self._image_conditioner(
                 lambda enc: combined_image_conditionings(
-                    images=[],
+                    images=frame_inputs,
                     height=job.height,
                     width=job.width,
                     video_encoder=enc,
@@ -759,9 +785,18 @@ async def _worker() -> None:
 
 def _run_job(job: Job) -> None:
     """Execute a single generation job (runs in thread-pool)."""
-    with torch.inference_mode():
-        model_manager.generate(job)
-    job.status = JobStatus.COMPLETED
+    try:
+        with torch.inference_mode():
+            model_manager.generate(job)
+        job.status = JobStatus.COMPLETED
+    finally:
+        # Clean up temp frame files regardless of success or failure.
+        for p in (job.start_frame_path, job.end_frame_path):
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +862,20 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
 
     seed = req.seed if req.seed is not None else DEFAULT_SEED
 
+    # Decode optional base64 frames → temp PNG files.
+    def _decode_frame(b64: str, label: str) -> str:
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 in {label}")
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.write(raw)
+        tmp.close()
+        return tmp.name
+
+    start_frame_path = _decode_frame(req.start_frame_b64, "start_frame_b64") if req.start_frame_b64 else None
+    end_frame_path   = _decode_frame(req.end_frame_b64,   "end_frame_b64")   if req.end_frame_b64   else None
+
     job = Job(
         job_id=str(uuid.uuid4()),
         prompt=req.prompt,
@@ -836,10 +885,76 @@ async def generate(req: GenerateRequest) -> GenerateResponse:
         num_frames=req.num_frames,
         fps=req.fps,
         seed=seed,
+        start_frame_path=start_frame_path,
+        end_frame_path=end_frame_path,
     )
     _register_job(job)
     await _generation_queue.put(job)
 
+    return GenerateResponse(job_id=job.job_id, status=job.status.value)
+
+
+@app.post("/generate-frames", response_model=GenerateResponse)
+async def generate_frames(
+    prompt: str = Form(...),
+    negative_prompt: str = Form(default=""),
+    width: int = Form(default=DEFAULT_WIDTH),
+    height: int = Form(default=DEFAULT_HEIGHT),
+    num_frames: int = Form(default=DEFAULT_NUM_FRAMES),
+    fps: int = Form(default=DEFAULT_FPS),
+    seed: int | None = Form(default=None),
+    start_frame: UploadFile | None = File(default=None),
+    end_frame: UploadFile | None = File(default=None),
+) -> GenerateResponse:
+    """Submit a generation job with optional start/end frame images (multipart form).
+
+    Upload images as multipart files.  ``start_frame`` anchors the first frame
+    of the video; ``end_frame`` anchors the last.  Both are optional — omit
+    either for unconditioned generation at that end.
+
+    Curl example::
+
+        curl -X POST http://localhost:8000/generate-frames \\
+          -F prompt="a fox riding a bicycle" \\
+          -F width=1024 -F height=576 -F num_frames=97 \\
+          -F start_frame=@start.png \\
+          -F end_frame=@end.png
+    """
+    if width % 64 != 0 or height % 64 != 0:
+        raise HTTPException(status_code=400, detail="Width and height must be multiples of 64.")
+    if (num_frames - 1) % 8 != 0:
+        raise HTTPException(status_code=400, detail="num_frames must satisfy (num_frames - 1) % 8 == 0.")
+
+    def _save_upload(upload: UploadFile, label: str) -> str:
+        data = asyncio.get_event_loop().run_until_complete(upload.read()) if False else None
+        # We're in an async context — use await properly via helper.
+        raise RuntimeError("use _save_upload_async")
+
+    async def _save_upload_async(upload: UploadFile) -> str:
+        data = await upload.read()
+        tmp = tempfile.NamedTemporaryFile(suffix=Path(upload.filename or "frame.png").suffix or ".png", delete=False)
+        tmp.write(data)
+        tmp.close()
+        return tmp.name
+
+    start_frame_path = await _save_upload_async(start_frame) if start_frame else None
+    end_frame_path   = await _save_upload_async(end_frame)   if end_frame   else None
+
+    resolved_seed = seed if seed is not None else DEFAULT_SEED
+    job = Job(
+        job_id=str(uuid.uuid4()),
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        num_frames=num_frames,
+        fps=fps,
+        seed=resolved_seed,
+        start_frame_path=start_frame_path,
+        end_frame_path=end_frame_path,
+    )
+    _register_job(job)
+    await _generation_queue.put(job)
     return GenerateResponse(job_id=job.job_id, status=job.status.value)
 
 
@@ -982,6 +1097,8 @@ async def _v1_generate(
     height: int,
     num_frames: int,
     fps: int,
+    start_frame_path: str | None = None,
+    end_frame_path: str | None = None,
 ) -> bytes:
     """Submit a generation job, wait for it, and return the raw MP4 bytes.
 
@@ -1000,6 +1117,8 @@ async def _v1_generate(
         num_frames=num_frames,
         fps=fps,
         seed=seed,
+        start_frame_path=start_frame_path,
+        end_frame_path=end_frame_path,
     )
     _register_job(job)
 
@@ -1101,8 +1220,14 @@ async def v1_image_to_video(req: _V1ImageToVideoRequest, request: Request) -> Re
     """
     _v1_check_auth(request)
 
-    # Resolve upload so we fail fast if the URI is unknown
-    _v1_resolve_upload(req.image_uri)
+    # Resolve upload — fail fast if URI is unknown, get raw bytes.
+    image_bytes = _v1_resolve_upload(req.image_uri)
+
+    # Save to a temp file so the image conditioner can load it.
+    tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp.write(image_bytes)
+    tmp.close()
+    start_frame_path = tmp.name
 
     raw_w, raw_h = _v1_parse_resolution(req.resolution)
     width, height = _v1_snap_to_t4(raw_w, raw_h)
@@ -1111,15 +1236,13 @@ async def v1_image_to_video(req: _V1ImageToVideoRequest, request: Request) -> Re
     cam = req.camera_motion or "none"
     prompt = req.prompt + _CAMERA_MOTION_PROMPTS.get(cam, "")
 
-    logger.warning(
-        "[v1/i2v] image conditioning not yet wired in — generating text-to-video with the same prompt"
-    )
     video_bytes = await _v1_generate(
         prompt=prompt,
         width=width,
         height=height,
         num_frames=num_frames,
         fps=fps,
+        start_frame_path=start_frame_path,
     )
     return Response(content=video_bytes, media_type="video/mp4")
 
