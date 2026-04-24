@@ -13,6 +13,11 @@ dist/
 build/
 *.egg
 
+# Vendored packages: keep source, ignore build artefacts
+vendor/**/*.egg-info/
+vendor/**/dist/
+vendor/**/__pycache__/
+
 # Virtual environment
 venv/
 .venv/

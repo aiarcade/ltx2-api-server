@@ -17,6 +17,14 @@ fi
 echo "Starting LTX-2.3 server on port $PORT …"
 cd "$SCRIPT_DIR"
 
+# Ensure vendored packages are installed (idempotent)
+PYTHON="$SCRIPT_DIR/venv/bin/python"
+if ! "$PYTHON" -c "import ltx_core" 2>/dev/null; then
+    echo "Installing vendored ltx-core and ltx-pipelines …"
+    "$SCRIPT_DIR/venv/bin/pip" install --no-deps -q -e vendor/ltx-core
+    "$SCRIPT_DIR/venv/bin/pip" install --no-deps -q -e vendor/ltx-pipelines
+fi
+
 # Load .env if present (sets LTX_API_KEY etc.)
 if [[ -f .env ]]; then
     set -a; source .env; set +a
