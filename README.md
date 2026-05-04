@@ -6,13 +6,9 @@ A self-hosted **FastAPI inference server** for [LTX-Video 2.3](https://github.co
 
 ## Sample Outputs
 
-**Samurai warrior in a moonlit bamboo forest** — 1024×576, 24 fps
+**Demo video**
 
-[![Samurai sample](assets/thumb_samurai.jpg)](assets/sample_samurai.mp4)
-
-**Abstract 5-second test clip** — 512×256, 30 fps
-
-[![5s sample](assets/thumb_5s.jpg)](assets/sample_5s.mp4)
+[![Demo](assets/thumb_demo.jpg)](assets/demo.mp4)
 
 ---
 
