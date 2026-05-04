@@ -1,8 +1,8 @@
-# Environment / secrets
+# Environment / secrets — never commit real keys
 .env
 *.env
 
-# Python
+# Python bytecode
 __pycache__/
 *.py[cod]
 *.pyo
@@ -13,24 +13,37 @@ dist/
 build/
 *.egg
 
-# Vendored packages: keep source, ignore build artefacts
+# Vendored packages: keep source, ignore build artefacts only
 vendor/**/*.egg-info/
 vendor/**/dist/
 vendor/**/__pycache__/
+vendor/**/*.pyc
 
 # Virtual environment
 venv/
 .venv/
 env/
 
-# Model weights (large binary files)
+# Model weights (large binary files — download separately)
 models/
 
-# Generated outputs
+# Generated video outputs
 outputs/
-result*.mp4
 
-# LTX-Desktop source (separate project, not part of this repo)
+# Root-level test/scratch videos (keep assets/ folder)
+result*.mp4
+*.mp4
+!assets/*.mp4
+
+# Project-internal / scratch files
+scene1_*.png
+test_*.png
+submit_commnd
+skill.md
+design.md
+__pycache__/
+
+# LTX-Desktop source (separate project)
 LTX-Desktop/
 
 # Editor
@@ -44,6 +57,5 @@ LTX-Desktop/
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and temp
 *.log
-/tmp/

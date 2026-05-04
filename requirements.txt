@@ -1,12 +1,13 @@
-# PyTorch (CUDA 12.1)
+# PyTorch (CUDA 12.1) — for CUDA 11.8 use cu118 instead
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1
 torchvision
 torchaudio
 
-# LTX-2 packages (installed from the cloned LTX-2 repo)
-# pip install -e /path/to/LTX-2/packages/ltx-core
-# pip install -e /path/to/LTX-2/packages/ltx-pipelines
+# LTX-2 core packages — vendored in this repo, install with:
+#   pip install --no-deps -e vendor/ltx-core
+#   pip install --no-deps -e vendor/ltx-pipelines
+# (server-start.sh does this automatically)
 
 # Server dependencies
 fastapi>=0.115.0
